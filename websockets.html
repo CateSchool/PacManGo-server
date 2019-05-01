@@ -1,0 +1,38 @@
+<button id="button1">Set New Random Location</button>
+<div id="userID"></div>
+<br>
+<button id="clear">Clear</button>
+
+<pre id="output"></pre>
+
+<script>
+    const userId = `jason_zhao+${Math.random()}@cate.org`
+
+	var input = document.getElementById("input")
+	var output = document.getElementById("output")
+    var clear = document.getElementById("clear")
+    document.getElementById('userID').innerHTML = userId
+
+	var socket = new WebSocket("ws://localhost:8080/sockets")
+
+    clear.onclick = output.innerHtml = ""
+    document.getElementById('button1').onclick = e => {e.preventDefault(); updateOwnLocation()}
+
+	socket.onopen = function () {
+        output.innerHTML += "Status: Connected\n"
+        updateOwnLocation()
+	}
+
+	socket.onmessage = function (e) {
+		output.innerHTML = "Server: " + JSON.stringify(JSON.parse(e.data), null, 4) + "\n"
+	}
+
+    function updateOwnLocation(e) {
+        socket.send(JSON.stringify({
+            action: "updateOwnLocation",
+            userID: userId,	
+            latitude: Math.random(),
+            longitude: Math.random()
+        }))
+    }
+</script>
