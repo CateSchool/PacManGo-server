@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"time"
@@ -13,39 +14,6 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-}
-
-/*************
- * State
- *************/
-
-type powerUps struct {
-	canEatGhost bool
-}
-type playerState struct {
-	UserID            string
-	Longitude         float64
-	Latitude          float64
-	role              string
-	alive             bool
-	powerUps          powerUps
-	connectedToServer bool
-}
-type connectionState struct {
-	*websocket.Conn
-	UserID string
-}
-
-type gameStatus struct {
-	isBeaconUUID string
-	started      bool
-	timeElapsed  uint64
-}
-type state struct {
-	messages         chan rawMessage
-	playerStates     []playerState
-	connectionStates map[int]connectionState
-	gameStatus       gameStatus
 }
 
 /****************
@@ -67,125 +35,164 @@ type message struct {
  * State Updates
  *****************/
 
-func (s *state) listenForMessages() {
-	// by passing all messages through a channel, we make our state updates atomic
-	for raw := range s.messages {
-		var msg message
-		err := json.Unmarshal(raw.b, &msg)
+type client chan<- []byte // data to write to the client
 
+var (
+	enteringClients  = make(chan client)
+	leavingClients   = make(chan client)
+	incomingMessages = make(chan rawMessage)
+	outgoingMessages = make(chan []byte)
+	states           = make(chan state)
+)
+
+func handleConn(conn *websocket.Conn) {
+	log.Println("new client has joined")
+	cli := make(chan []byte)
+	enteringClients <- cli
+
+	go writeClient(conn, cli)
+
+	// Read message from browser
+	for {
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Printf("error: %s\n", err)
-			return
+			log.Printf("error reading message: %s\n", err)
+			// fmt.Printf("    i=%d, state=%+v\n", i, s)
+			break
 		}
-
-		fmt.Printf("action: %s\n", msg.Action)
-
-		if msg.Action != "updateOwnLocation" {
-			panic(fmt.Sprintf("The only action available is updateOwnLocation, requested %#v", msg.Action))
-		}
-
-		// our connections are stateful; update the connection state
-		x := s.connectionStates[raw.connectionID]
-		x.UserID = msg.UserID
-		s.connectionStates[raw.connectionID] = x
-
-		s.updateOwnLocation(msg)
-	}
-}
-
-/***************/
-
-func (s *state) updateOwnLocation(msg message) {
-	for i := range s.playerStates {
-		playerLocation := &s.playerStates[i]
-		if playerLocation.UserID == msg.UserID {
-			playerLocation.Longitude = msg.Longitude
-			playerLocation.Latitude = msg.Latitude
-			return
-		}
+		incomingMessages <- rawMessage{b: msg}
 	}
 
-	// add a new Player
-	s.playerStates = append(s.playerStates, playerState{
-		UserID:            msg.UserID,
-		Longitude:         msg.Longitude,
-		Latitude:          msg.Latitude,
-		role:              [2]string{"ghost", "pacman"}[rand.Intn(2)],
-		alive:             true,
-		connectedToServer: true,
-	})
-	fmt.Printf("adding new player, new playerStates: \n %+v", s.playerStates)
-}
-func (s *state) deleteConnectionAndPlayer(key int) {
-	UserID := s.connectionStates[key].UserID
-
-	if UserID != "" {
-		for i := range s.playerStates {
-			if s.playerStates[i].UserID == UserID {
-				s.playerStates[i] = s.playerStates[len(s.playerStates)-1]
-				s.playerStates = s.playerStates[:len(s.playerStates)-1]
-				return
-			}
-		}
-	}
-	delete(s.connectionStates, key)
+	// Leaving
+	leavingClients <- cli
+	conn.Close()
 }
 
-func main() {
+// by passing all messages through a channel, we make our state updates atomic
+func listenForMessages() {
 
 	var s = state{
-		messages:         make(chan rawMessage),
-		connectionStates: make(map[int]connectionState),
 		gameStatus: gameStatus{
-			isBeaconUUID: "DD09F8AB-0B4A-4890-870D-21ACAA35277F",
+			iBeaconUUID: "DD09F8AB-0B4A-4890-870D-21ACAA35277F",
 		},
 	}
+	states <- s
+	clients := make(map[client]bool) // all connected clients
 
-	go s.listenForMessages()
+	for {
+		fmt.Printf("Number of clients: %d\n", len(clients))
+		select {
+		case raw := <-incomingMessages:
+			var msg message
+			err := json.Unmarshal(raw.b, &msg)
 
-	// Update client at regular intervals with state
-	ticker := time.NewTicker(100 * time.Millisecond)
+			if err != nil {
+				fmt.Printf("error: %s\n", err)
+				return
+			}
+
+			fmt.Printf("action: %s\n", msg.Action)
+
+			if msg.Action != "updateOwnLocation" {
+				panic(fmt.Sprintf("The only action available is updateOwnLocation, requested %#v", msg.Action))
+			}
+
+			for i := range s.playerStates {
+				playerLocation := &s.playerStates[i]
+				if playerLocation.UserID == msg.UserID {
+					playerLocation.Longitude = msg.Longitude
+					playerLocation.Latitude = msg.Latitude
+					return
+				}
+			}
+
+			// add a new Player
+			s.playerStates = append(s.playerStates, playerState{
+				UserID:            msg.UserID,
+				Longitude:         msg.Longitude,
+				Latitude:          msg.Latitude,
+				role:              [2]string{"ghost", "pacman"}[rand.Intn(2)],
+				alive:             true,
+				connectedToServer: true,
+			})
+			fmt.Printf("adding new player, new playerStates: \n %+v", s.playerStates)
+
+			//go func(s state) {
+			states <- s
+			// }(s)
+		case msg := <-outgoingMessages:
+			for cli := range clients {
+				cli <- msg
+			}
+		case cli := <-enteringClients:
+			clients[cli] = true
+		case cli := <-leavingClients:
+			delete(clients, cli)
+			close(cli)
+		}
+
+		fmt.Printf("current state: \n")
+		fmt.Println(s)
+		fmt.Println()
+	}
+}
+
+// Regularly update clients with the state
+func regularlyUpdateClients(states <-chan state) {
+	s := <-states
+
 	go func() {
-		for range ticker.C {
-			returnMessage, _ := json.Marshal(s)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		for {
+			fmt.Printf("Sending current state to all clients: \n")
+			fmt.Println(s)
 
 			// Write message back
-			for key, conn := range s.connectionStates {
-				if err := conn.WriteMessage(websocket.TextMessage, returnMessage); err != nil {
-					s.deleteConnectionAndPlayer(key)
-				}
+			returnMessage, _ := json.Marshal(s)
+			outgoingMessages <- returnMessage
+
+			// update either every 100 milliseconds or when we get a new state
+			select {
+			case <-ticker.C:
+			case s = <-states:
 			}
 		}
 	}()
+}
 
-	// Taking messages from the client
-	connectionsCounter := 0
-	http.HandleFunc("/sockets", func(w http.ResponseWriter, r *http.Request) {
-		conn, _ := upgrader.Upgrade(w, r, nil) // error ignored for sake of simplicity
-
-		i := connectionsCounter
-		connectionsCounter++
-
-		s.connectionStates[i] = connectionState{conn, ""}
-
-		for {
-			// Read message from browser
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				fmt.Printf("error reading message: %s\n", err)
-				fmt.Printf("    i=%d, state=%+v\n", i, s)
-				s.deleteConnectionAndPlayer(i)
-				return
-			}
-			// fmt.Printf("received: %s\n", string(msg))
-			s.messages <- rawMessage{connectionID: i, b: msg}
+func writeClient(conn *websocket.Conn, ch <-chan []byte) {
+	for msg := range ch {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+			// delete the client if we don't need him anymore
+			// s.deleteConnectionAndPlayer(key)
 		}
+	}
+}
+
+/***********/
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	go listenForMessages()
+	go regularlyUpdateClients(states)
+
+	http.HandleFunc("/sockets", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("new client has joined")
+		conn, _ := upgrader.Upgrade(w, r, nil) // error ignored for sake of simplicity
+		handleConn(conn)
 	})
+
+	// serverAddress := "172.17.2.225:8080"
+	serverAddress := ":8000"
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "websockets.html")
 	})
 
-	http.ListenAndServe("172.17.2.225:8080", nil)
-	// http.ListenAndServe(":8080", nil)
+	fmt.Printf("Server listening on %s\n", serverAddress)
+	err := http.ListenAndServe(serverAddress, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
